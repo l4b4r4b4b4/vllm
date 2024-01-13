@@ -2,13 +2,13 @@ import collections
 from copy import deepcopy, copy
 from dataclasses import dataclass, fields
 import functools
-import multiprocessing
-import queue
 import regex
 import torch
 from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 from typing import Optional, List, Set, Union
 import weakref
+import multiprocessing
+import queue
 
 import ray
 
@@ -17,9 +17,10 @@ from lark.parsers.lalr_interactive_parser import InteractiveParser
 from lark.parsers.lalr_parser_state import ParserState
 from lark.lexer import Token, Pattern, PatternStr, PatternRE
 
-import subprocess
 
-GRAMMAR_PROCESSES = 16
+
+
+
 
 #########################################################################
 # Fix Lark Interactive LALR Parser Speed Issue
@@ -134,16 +135,21 @@ def get_pattern_validator(pattern: Pattern):
 def method_lru_cache(*lru_args, **lru_kwargs):
     # https://stackoverflow.com/a/44078118
     def decorator(func):
+
         @functools.wraps(func)
         def wrapped_func(self, *args, **kwargs):
             self_weak = weakref.ref(self)
+
             @functools.wraps(func)
             @functools.lru_cache(*lru_args, **lru_kwargs)
             def cached_method(*args, **kwargs):
                 return func(self_weak(), *args, **kwargs)
+
             setattr(self, func.__name__, cached_method)
             return cached_method(*args, **kwargs)
+
         return wrapped_func
+
     return decorator
 
 
@@ -223,6 +229,7 @@ class IncrementalParserState:
         return f"{self.__class__.__name__}({self.interactive_parser.parser_state.state_stack})"
 
     @classmethod
+
     def from_grammar(cls, grammar: str, start: str):
         lark_parser = Lark(
             grammar,
@@ -297,7 +304,7 @@ class IncrementalParserState:
             return "", self
 
         best_terminal, processed_seq, remainder_seq = self.get_best_matched_terminal(
-           new_seq)
+            new_seq)
 
         # invalid
         if best_terminal is None:
@@ -315,14 +322,12 @@ class IncrementalParserState:
             else:
                 return new_parser.step(remainder_seq)
 
-
     @memoize_by_instance
     def _next_with_new_terminal(self, terminal):
         if terminal in self._ignored_terms:
             new_interactive_parser = self.interactive_parser
         else:
-            new_interactive_parser = self.get_stepped_parser_state(
-                terminal)
+            new_interactive_parser = self.get_stepped_parser_state(terminal)
 
         return self.new(
             interactive_parser=new_interactive_parser,
@@ -368,8 +373,7 @@ class TokenVocab:
     """
 
     def __init__(self,
-                 tokenizer: Union[PreTrainedTokenizer,
-                                  PreTrainedTokenizerFast],
+                 tokenizer: PreTrainedTokenizerFast, #force use of fast tokenizer
                  legal_chars: Optional[Set[str]] = None):
 
         self.norm_vocab = collections.defaultdict(set)
@@ -389,8 +393,7 @@ class TokenVocab:
 
     def __getitem__(self, tok_str):
         return self.norm_vocab[tok_str]
-
-
+    
 class NextTokenStrValidatorProcess(multiprocessing.Process):
     def __init__(self, grammar, grammar_start, vocab_subset):
         super().__init__()
@@ -404,17 +407,13 @@ class NextTokenStrValidatorProcess(multiprocessing.Process):
     def run(self):
         while self.running:
             full_seq = self.task_queue.get()
-            results = self.get_valid_next_token_strs(full_seq)
-            self.result_queue.put(results)
-        #print("Shutting down!")
-        #sys.exit()
-        #del self
- 
-
-    def shutdown(self):
-        #print("Shutdown initiated")
-        self.running = False
-        #sys.exit()
+            if full_seq is None:
+                self.running = False
+                break
+            else:
+                results = self.get_valid_next_token_strs(full_seq)
+                self.result_queue.put(results)
+                self.result_queue.put(("DONE",))  # Sentinel to signal end of this task's results
 
 
     def get_valid_next_token_strs(self, full_seq):
@@ -441,6 +440,9 @@ class NextTokenStrValidatorProcess(multiprocessing.Process):
             results.extend(self.result_queue.get_nowait())
         return results
 
+    def stop_process(self):
+        self.add_task(None)
+
 
 class NextTokenValidator:
 
@@ -450,42 +452,29 @@ class NextTokenValidator:
         grammar: str,
         grammar_start: str = "start",
         legal_chars: Optional[set[str]] = None,
-        n_proc: int = GRAMMAR_PROCESSES
+        n_proc: int = 16
     ):
         self.tokenizer = tokenizer
         self.vocab = TokenVocab(tokenizer, legal_chars=legal_chars)
-
-        self.validator_processes = [
-            NextTokenStrValidatorProcess(grammar, grammar_start, vocab_subset)
-            for vocab_subset in self._get_vocab_split(self.vocab, n_proc)
-        ]
-
-        # Start each process
-        for proc in self.validator_processes:
-            proc.start()
-
-    @staticmethod
-    def _get_vocab_split(vocab, n_partitions):
-        # evenly distribute length
-        vocab = sorted(vocab, key=lambda x: len(x) if x else 0)
-        # round robin construction
-        return [vocab[i::n_partitions] for i in range(n_partitions)]
+        self.root_parser = IncrementalParserState.from_grammar(
+            grammar, grammar_start)
 
     def get_valid_next_token_strs(self, full_seq):
-        for proc in self.validator_processes:
-            proc.add_task(full_seq)
+        """
+        Generate valid token strings given the full sequence
+        """
 
-        results_received = [False] * len(self.validator_processes)
-
-        while not all(results_received):
-            for i, proc in enumerate(self.validator_processes):
-                if not results_received[i]:
-                    try:
-                        result = proc.result_queue.get(timeout=0.00001)
-                        yield from result
-                        results_received[i] = True
-                    except queue.Empty:
-                        pass
+        result = self.root_parser[full_seq]
+        if result is None:
+            return []
+        partial_term, parser = result
+        for token in self.vocab:
+            if token is None:
+                if partial_term == "" and parser.is_valid_next_seq(token):
+                    yield None
+            else:
+                if parser.is_valid_next_seq(partial_term + token):
+                    yield token
 
     def get_valid_next_token_ids(self, full_seq):
         """
@@ -493,18 +482,6 @@ class NextTokenValidator:
         """
         for tok_str in self.get_valid_next_token_strs(full_seq):
             yield from self.vocab[tok_str]
-
-    def __del__(self):
-        """ Terminate all processes. """
-        for proc in self.validator_processes:
-            #print(proc)
-            proc.shutdown()
-            pid = proc.pid
-            del proc
-            subprocess.Popen(["kill", "-9", str(pid)]) #Since python's .terminate() straight up doesn't work
-                                 
-
-
 
 
 class GrammarLogitsProcessor(NextTokenValidator):
@@ -529,18 +506,22 @@ class GrammarLogitsProcessor(NextTokenValidator):
 
 @ray.remote
 class GrammarLogitsProcessorActor:
+
     def __init__(self, *args, **kwargs):
         self.processor = GrammarLogitsProcessor(*args, **kwargs)
 
-    def process_logits(self, token_ids: List[int], logits: torch.Tensor) -> torch.Tensor:
+    def process_logits(self, token_ids: List[int],
+                       logits: torch.Tensor) -> torch.Tensor:
         return self.processor(token_ids, logits)
 
 
 class RayRemoteGrammarLogitsProcessor:
+
     def __init__(self, *args, **kwargs):
         self.actor = GrammarLogitsProcessorActor.remote(*args, **kwargs)
 
-    def __call__(self, token_ids: List[int], logits: torch.Tensor) -> torch.Tensor:
+    def __call__(self, token_ids: List[int],
+                 logits: torch.Tensor) -> torch.Tensor:
         logits_cpu = logits.cpu()
         result_id = self.actor.process_logits.remote(token_ids, logits_cpu)
         return ray.get(result_id)
