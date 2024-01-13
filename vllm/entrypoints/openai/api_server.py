@@ -36,6 +36,7 @@ from vllm.transformers_utils.tokenizer import get_tokenizer
 from vllm.utils import random_uuid
 
 TIMEOUT_KEEP_ALIVE = 5  # seconds
+STATIC_GRAMMAR = False
 
 logger = init_logger(__name__)
 served_model = None
@@ -505,8 +506,8 @@ async def create_completion(request: CompletionRequest, raw_request: Request):
     if request.grammar:
 
         #https://github.com/lapp0/vllm/blob/grammar/docs/source/grammars/grammars.rst
-        static = False
-        if static:
+
+        if STATIC_GRAMMAR:
             allowed_chars = set(map(chr, range(256))) # restrict to utf-8
         else:
             #Restrict grammar characters to typable characters, characters in the grammar definition, and characters in the prompt.

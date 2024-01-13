@@ -15,6 +15,7 @@ import time
 logittime = 0
 execstart = 0
 prevtime = 0
+LOGIT_LOG_INTERVAL_SECONDS = 4
 
 
 class Sampler(nn.Module):
@@ -72,12 +73,10 @@ class Sampler(nn.Module):
         logits = _apply_logits_processors(logits, sampling_metadata)
         stop = time.time()
         logittime = logittime + stop - start
-        otherexectime = stop - execstart - logittime
-        if stop - prevtime > 1:
+        if stop - prevtime > LOGIT_LOG_INTERVAL_SECONDS: 
             print("Logit processing time for current token: " + str(stop - start) + " seconds")
-            print("Total logit processing time: " + str(logittime) + " seconds")
-            print("Time elapsed since startup - logit processing time: " + str(stop - execstart) + " seconds")
-            print("Time elapsed since startup - logit processing time: " + str(otherexectime) + " seconds")
+            print("Total accumulated logit processing time: " + str(logittime) + " seconds")
+            print("Time elapsed since startup: " + str(stop - execstart) + " seconds")
             prevtime = stop
         
 
