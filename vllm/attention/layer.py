@@ -171,6 +171,7 @@ class Attention(nn.Module, AttentionLayerBase):
         kv_sharing_target_layer_name: str | None = None,
         attn_backend: type[AttentionBackend] | None = None,
         head_size_v: int | None = None,
+        rotary_emb: nn.Module | None = None,
         **extra_impl_args,
     ) -> None:
         """
@@ -243,7 +244,6 @@ class Attention(nn.Module, AttentionLayerBase):
             )
         else:
             self.attn_backend = attn_backend
-
         # prefix caching + batch invariance is currently not supported for
         # FLASHINFER and TRITON_MLA.
         if (
@@ -276,6 +276,7 @@ class Attention(nn.Module, AttentionLayerBase):
             kv_sharing_target_layer_name,
             **extra_impl_args,
         )
+        self.impl.rotary_emb = rotary_emb
         self.backend = AttentionBackendEnum[self.attn_backend.get_name()]
         self.dtype = dtype
 
@@ -330,6 +331,7 @@ class Attention(nn.Module, AttentionLayerBase):
         # shape does not match the query shape, so we optionally let the model
         # definition specify the output tensor shape.
         output_shape: torch.Size | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         The KV cache is stored inside this class and is accessed via
@@ -386,7 +388,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 )
             else:
                 torch.ops.vllm.unified_attention_with_output(
-                    query, key, value, output, self.layer_name
+                    query, key, value, output, self.layer_name, positions=positions
                 )
             return output.view(-1, hidden_size)
         else:
@@ -491,6 +493,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         prefix: str = "",
         use_sparse: bool = False,
         indexer: object | None = None,
+        rotary_emb: nn.Module | None = None,
         **extra_impl_args,
     ):
         super().__init__()
@@ -573,6 +576,8 @@ class MLAAttention(nn.Module, AttentionLayerBase):
             **extra_impl_args,
         )
 
+        self.impl.rotary_emb = rotary_emb
+
         self.use_direct_call = not current_platform.opaque_attention_op()
 
         compilation_config = get_current_vllm_config().compilation_config
@@ -600,6 +605,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
         output_shape: torch.Size | None = None,
+        positions: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if self.calculate_kv_scales:
             torch.ops.vllm.maybe_calc_kv_scales(q, kv_c_normed, k_pe, self.layer_name)
@@ -636,6 +642,7 @@ class MLAAttention(nn.Module, AttentionLayerBase):
                     k_pe,
                     output,
                     self.layer_name,
+                    positions=positions,
                 )
                 return output
             else:
@@ -801,9 +808,24 @@ def unified_attention_with_output(
     layer_name: str,
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
 ) -> None:
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
-
+    if positions is not None:
+        assert hasattr(self.impl, "rotary_emb") and self.impl.rotary_emb is not None
+        self.impl.forward(
+            self,
+            query,
+            key,
+            value,
+            kv_cache,
+            attn_metadata,
+            output=output,
+            output_scale=output_scale,
+            output_block_scale=output_block_scale,
+            positions=positions,
+        )
+        return
     self.impl.forward(
         self,
         query,
@@ -825,6 +847,7 @@ def unified_attention_with_output_fake(
     layer_name: str,
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
+    positions: torch.Tensor | None = None,
 ) -> None:
     return
 
@@ -875,21 +898,38 @@ def unified_mla_attention_with_output(
     k_pe: torch.Tensor,
     output: torch.Tensor,
     layer_name: str,
+    positions: torch.Tensor | None = None,
     output_scale: torch.Tensor | None = None,
     output_block_scale: torch.Tensor | None = None,
 ) -> None:
     attn_metadata, self, kv_cache = get_attention_context(layer_name)
-    self.impl.forward(
-        self,
-        q,
-        kv_c_normed,
-        k_pe,
-        kv_cache,
-        attn_metadata,
-        output=output,
-        output_scale=output_scale,
-        output_block_scale=output_block_scale,
-    )
+    from vllm.v1.attention.backends.mla.rocm_aiter_mla import AiterMLAImpl
+
+    if isinstance(self.impl, AiterMLAImpl):
+        self.impl.forward(
+            self,
+            q,
+            kv_c_normed,
+            k_pe,
+            kv_cache,
+            attn_metadata,
+            output=output,
+            output_scale=output_scale,
+            output_block_scale=output_block_scale,
+            positions=positions,
+        )
+    else:
+        self.impl.forward(
+            self,
+            q,
+            kv_c_normed,
+            k_pe,
+            kv_cache,
+            attn_metadata,
+            output=output,
+            output_scale=output_scale,
+            output_block_scale=output_block_scale,
+        )
 
 
 def unified_mla_attention_with_output_fake(
